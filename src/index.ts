@@ -257,6 +257,72 @@ private setupMessageHandlers(): void {
     }
   }
 
+  private async extractTicketIdFromReply(replyMessage: TelegramBot.Message): Promise<number | null> {
+    try {
+      console.log(`🔍 Extracting ticket ID from reply message...`);
+      
+      if (!replyMessage.text) {
+        console.log(`❌ Reply message has no text content`);
+        return null;
+      }
+
+      console.log(`📝 Reply message text: "${replyMessage.text}"`);
+
+      // Look for ticket number patterns in the replied message
+      // Pattern 1: "New Ticket #123456" or "Ticket #123456" (flexible digit count)
+      const ticketPattern1 = replyMessage.text.match(/Ticket #(\d+)/);
+      if (ticketPattern1) {
+        const ticketId = parseInt(ticketPattern1[1]);
+        console.log(`✅ Pattern 1 matched: Ticket #${ticketId}`);
+        // Verify this ticket exists in the database
+        const ticket = await this.sessionManager.getTicketById(ticketId);
+        if (ticket) {
+          console.log(`✅ Verified ticket #${ticketId} exists in database`);
+          return ticketId;
+        } else {
+          console.log(`❌ Ticket #${ticketId} not found in database`);
+        }
+      }
+
+      // Pattern 2: "#123456" at the beginning of a line (flexible digit count)
+      const ticketPattern2 = replyMessage.text.match(/^#(\d+)/m);
+      if (ticketPattern2) {
+        const ticketId = parseInt(ticketPattern2[1]);
+        console.log(`✅ Pattern 2 matched: #${ticketId} at line start`);
+        // Verify this ticket exists in the database
+        const ticket = await this.sessionManager.getTicketById(ticketId);
+        if (ticket) {
+          console.log(`✅ Verified ticket #${ticketId} exists in database`);
+          return ticketId;
+        } else {
+          console.log(`❌ Ticket #${ticketId} not found in database`);
+        }
+      }
+
+      // Pattern 3: Look for any number that could be a ticket ID (as fallback)
+      const ticketPattern3 = replyMessage.text.match(/(\d+)/);
+      if (ticketPattern3) {
+        const potentialTicketId = parseInt(ticketPattern3[1]);
+        console.log(`🔍 Pattern 3 found potential ticket ID: ${potentialTicketId}, verifying in database...`);
+        
+        // Verify this ticket exists in the database
+        const ticket = await this.sessionManager.getTicketById(potentialTicketId);
+        if (ticket) {
+          console.log(`✅ Verified ticket #${potentialTicketId} exists in database`);
+          return potentialTicketId;
+        } else {
+          console.log(`❌ Ticket #${potentialTicketId} not found in database`);
+        }
+      }
+
+      console.log(`❌ No valid ticket ID patterns found in reply message`);
+      return null;
+    } catch (error) {
+      console.error('🔴 Error extracting ticket ID from reply:', error);
+      return null;
+    }
+  }
+
   private async getUserRole(chatId: number, username: string): Promise<UserRole> {
     const botConfig = config.getBotConfig();
     
@@ -470,12 +536,35 @@ private setupMessageHandlers(): void {
     const text = msg.text!;
     const username = msg.from!.username || '';
 
+    console.log(`👨‍💼 Manager message from @${username}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+    console.log(`📋 Has reply_to_message: ${msg.reply_to_message ? 'Yes' : 'No'}`);
+
     if (text === '/start') {
       await this.bot.sendMessage(chatId, 
         'Welcome to Customer Support! You will receive notifications when customers need help.\n\n' +
-        'To respond to a ticket, reply with: #XXXXXX Your response message'
+        '🎯 **How to respond to tickets:**\n' +
+        '• **Reply Method (Recommended):** Right-click on a ticket notification and select "Reply", then type your response\n' +
+        '• **Manual Method:** Type #XXXXXX followed by your response message\n\n' +
+        'Example: #123456 Thank you for contacting us. How can I help you?'
       );
       return;
+    }
+
+    // Check if this is a reply to a ticket notification
+    if (msg.reply_to_message) {
+      console.log(`🔍 Manager @${username} sent a reply message. Checking for ticket ID...`);
+      console.log(`📋 Reply to message ID: ${msg.reply_to_message.message_id}`);
+      console.log(`📋 Reply to message text: "${msg.reply_to_message.text?.substring(0, 200) || 'No text'}"`);
+      
+      const ticketId = await this.extractTicketIdFromReply(msg.reply_to_message);
+      if (ticketId) {
+        console.log(`✅ Found ticket ID #${ticketId} from reply. Processing response...`);
+        await this.handleManagerResponse(chatId, username, ticketId, text);
+        return;
+      } else {
+        console.log(`❌ Could not extract ticket ID from reply message`);
+        // Fall through to show help message
+      }
     }
 
     // Check if this is a ticket response (format: #XXXXXX message)
@@ -484,11 +573,23 @@ private setupMessageHandlers(): void {
       const ticketId = parseInt(ticketMatch[1]);
       const response = ticketMatch[2];
       
+      console.log(`📨 Manager @${username} responding to ticket #${ticketId} via manual format`);
       await this.handleManagerResponse(chatId, username, ticketId, response);
     } else {
+      console.log(`❌ No valid ticket format found. Showing help message.`);
       await this.bot.sendMessage(chatId, 
-        'To respond to a ticket, use the format: #XXXXXX Your response message\n' +
-        'Example: #123456 Thank you for contacting us. How can I help you?'
+        '🎯 **How to respond to tickets:**\n\n' +
+        '**Method 1 (Recommended):** Reply to ticket notifications\n' +
+        '• Right-click on any ticket notification\n' +
+        '• Select "Reply"\n' +
+        '• Type your response message\n\n' +
+        '**Method 2:** Manual format\n' +
+        '• Type: #XXXXXX Your response message\n' +
+        '• Example: #123456 Thank you for contacting us. How can I help you?\n\n' +
+        '🔍 **Debug Info:**\n' +
+        `• Your message: "${text}"\n` +
+        `• Has reply: ${msg.reply_to_message ? 'Yes' : 'No'}\n` +
+        `• Reply text: "${msg.reply_to_message?.text?.substring(0, 50) || 'N/A'}"`
       );
     }
   }
@@ -1211,18 +1312,26 @@ private setupMessageHandlers(): void {
         return;
       }
 
+      // Show current content and provide pre-filled template for editing
+      const preFilledTemplate = 
+        `EDIT_KB ${kbId}\n` +
+        `Category: ${entry.category}\n` +
+        `Question: ${entry.question}\n` +
+        `Context: ${entry.context || ''}\n` +
+        `Answer: ${entry.answer}`;
+
       await this.bot.sendMessage(chatId, 
-        `Current KB Entry:\n\n` +
+        `📝 **Editing KB Entry #${kbId}**\n\n` +
+        `**Current Content:**\n` +
         `Category: ${entry.category}\n` +
         `Question: ${entry.question}\n` +
         `Context: ${entry.context || 'N/A'}\n` +
         `Answer: ${entry.answer}\n\n` +
-        `To edit this entry, send the updated information in this format:\n\n` +
-        `EDIT_KB ${kbId}\n` +
-        `Category: [new category]\n` +
-        `Question: [new question]\n` +
-        `Context: [new context]\n` +
-        `Answer: [new answer]`
+        `**Instructions:**\n` +
+        `Copy the template below, modify only the parts you want to change, then send it:\n\n` +
+        `\`\`\`\n${preFilledTemplate}\n\`\`\`\n\n` +
+        `💡 **Tip:** You can copy this text and only change the specific fields you need to update.`,
+        { parse_mode: 'Markdown' }
       );
     } catch (error) {
       console.error('Error showing KB entry for edit:', error);
