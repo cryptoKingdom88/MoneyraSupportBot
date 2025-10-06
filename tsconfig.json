@@ -5,8 +5,11 @@
     "rootDir": "./src",
     "outDir": "./dist",
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
     "strict": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "downlevelIteration": true,
+    "skipLibCheck": true
   },
   "include": ["src"]
 }
