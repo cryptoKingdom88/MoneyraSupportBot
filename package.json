@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test:vector": "npm run build && node test_vector_integration.js",
+    "test:duplicates": "npm run build && node test_duplicate_detection.js",
+    "test:embeddings": "npm run build && node test_embedding_storage.js"
   },
   "keywords": [],
   "author": "",

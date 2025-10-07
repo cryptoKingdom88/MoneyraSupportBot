@@ -5,6 +5,8 @@ import { SessionManager } from './sessionManager/sessionManager';
 import { HistoryManager } from './historyManager/historyManager';
 import { KBManager } from './kbManager/kbManager';
 import { TicketStatus, MessageSide, Session } from './dbManager/types';
+import { VectorServiceClient } from './vectorService/vectorServiceClient';
+import { VectorIntegrationImpl, AutoResponseResult } from './kbManager/vectorIntegration';
 
 // User roles enum
 enum UserRole {
@@ -19,6 +21,8 @@ class CustomerSupportBot {
   private sessionManager!: SessionManager;
   private historyManager!: HistoryManager;
   private kbManager!: KBManager;
+  private vectorClient!: VectorServiceClient;
+  private vectorIntegration!: VectorIntegrationImpl;
   private managers: Set<number> = new Set(); // Cache of manager chat IDs
   private ticketClosureInterval?: NodeJS.Timeout;
   private managerReminderInterval?: NodeJS.Timeout;
@@ -68,7 +72,16 @@ class CustomerSupportBot {
       console.log('Initializing manager modules...');
       this.sessionManager = new SessionManager(db);
       this.historyManager = new HistoryManager(db);
-      this.kbManager = new KBManager(db);
+      
+      // Initialize vector service integration first
+      const vectorConfig = config.getVectorServiceConfig();
+      this.vectorClient = new VectorServiceClient(vectorConfig);
+      this.vectorIntegration = new VectorIntegrationImpl(this.vectorClient);
+      
+      // Initialize KBManager with vector integration
+      this.kbManager = new KBManager(db, this.vectorClient);
+      console.log(`Vector service integration initialized (enabled: ${vectorConfig.enabled})`);
+      
       console.log('Manager modules initialized');
       
       // Load existing managers into cache
@@ -366,6 +379,12 @@ private setupMessageHandlers(): void {
       return;
     }
 
+    // Handle CHECK_SIMILAR command
+    if (text.startsWith('CHECK_SIMILAR ')) {
+      await this.processCheckSimilar(chatId, text);
+      return;
+    }
+
     await this.bot.sendMessage(chatId, 'Please use the menu options or /start to see available commands.');
   }
 
@@ -449,77 +468,125 @@ private setupMessageHandlers(): void {
 
   private async processAddKB(chatId: number, text: string): Promise<void> {
     try {
-      // Parse KB entry format
+      // Parse KB entry format (Context is now auto-generated)
       const lines = text.split('\n');
-      let category = '', question = '', context = '', answer = '';
+      let category = '', question = '', answer = '';
 
       for (const line of lines) {
         if (line.startsWith('Category: ')) {
           category = line.replace('Category: ', '').trim();
         } else if (line.startsWith('Question: ')) {
           question = line.replace('Question: ', '').trim();
-        } else if (line.startsWith('Context: ')) {
-          context = line.replace('Context: ', '').trim();
         } else if (line.startsWith('Answer: ')) {
           answer = line.replace('Answer: ', '').trim();
         }
+        // Context is no longer parsed from user input - it will be auto-generated
       }
 
       if (!category || !question || !answer) {
-        await this.bot.sendMessage(chatId, 'Missing required fields. Please provide Category, Question, and Answer.');
+        await this.bot.sendMessage(chatId, '❌ Missing required fields. Please provide Category, Question, and Answer.\n\n📝 Format:\nCategory: category name\nQuestion: question content\nAnswer: answer content');
         return;
       }
 
-      const entryId = await this.kbManager.addEntry(category, question, context, answer);
-      await this.bot.sendMessage(chatId, `✅ KB entry #${entryId} added successfully!`);
+      // Use the new auto-context method with duplicate detection
+      const entryId = await this.kbManager.addEntryWithAutoContext(category, question, answer);
+      await this.bot.sendMessage(chatId, `✅ KB entry #${entryId} added successfully!\n🤖 Context was automatically generated.`);
       await this.showKBMenu(chatId);
 
     } catch (error) {
       console.error('Error adding KB entry:', error);
-      await this.sendErrorMessage(chatId, 'Error adding KB entry. Please try again.');
+      
+      // Check if it's a duplicate entry error
+      if (error instanceof Error && error.message.includes('Similar KB entry already exists')) {
+        await this.bot.sendMessage(chatId, `❌ ${error.message}\n\nPlease modify your question to make it more specific or check existing entries.`);
+      } else {
+        await this.sendErrorMessage(chatId, 'Error adding KB entry. Please try again.');
+      }
+    }
+  }
+
+  private async processCheckSimilar(chatId: number, text: string): Promise<void> {
+    try {
+      const question = text.replace('CHECK_SIMILAR ', '').trim();
+      
+      if (!question) {
+        await this.bot.sendMessage(chatId, '❌ Please provide a question to check.\n\nUsage: CHECK_SIMILAR [your question]');
+        return;
+      }
+
+      await this.bot.sendMessage(chatId, '🔍 Checking for similar entries...');
+
+      const similarCheck = await this.kbManager.findSimilarEntry(question);
+      
+      if (similarCheck.hasSimilar && similarCheck.similarEntry) {
+        const entry = similarCheck.similarEntry;
+        const score = similarCheck.similarityScore || 0;
+        
+        await this.bot.sendMessage(chatId, 
+          `⚠️ **Similar KB Entry Found**\n\n` +
+          `**Similarity Score:** ${(score * 100).toFixed(1)}%\n\n` +
+          `**Existing Entry #${entry.id}:**\n` +
+          `Category: ${entry.category}\n` +
+          `Question: ${entry.question}\n` +
+          `Answer: ${entry.answer}\n\n` +
+          `💡 Consider modifying your question to be more specific or updating the existing entry instead.`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await this.bot.sendMessage(chatId, 
+          `✅ **No Similar Entries Found**\n\n` +
+          `Your question: "${question}"\n\n` +
+          `You can proceed to add this as a new KB entry.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+    } catch (error) {
+      console.error('Error checking similar entries:', error);
+      await this.sendErrorMessage(chatId, 'Error checking for similar entries. Please try again.');
     }
   }
 
   private async processEditKB(chatId: number, text: string): Promise<void> {
     try {
-      // Parse: EDIT_KB id\nCategory: ...\nQuestion: ...\nContext: ...\nAnswer: ...
+      // Parse: EDIT_KB id\nCategory: ...\nQuestion: ...\nAnswer: ... (Context is auto-generated)
       const lines = text.split('\n');
       const firstLine = lines[0].split(' ');
       
       if (firstLine.length !== 2) {
-        await this.bot.sendMessage(chatId, 'Invalid format. Use: EDIT_KB id');
+        await this.bot.sendMessage(chatId, '❌ Invalid format. Usage: EDIT_KB id');
         return;
       }
 
       const kbId = parseInt(firstLine[1]);
       if (isNaN(kbId)) {
-        await this.bot.sendMessage(chatId, 'Invalid KB ID.');
+        await this.bot.sendMessage(chatId, '❌ Invalid KB ID.');
         return;
       }
 
-      let category = '', question = '', context = '', answer = '';
+      let category = '', question = '', answer = '';
 
       for (const line of lines.slice(1)) {
         if (line.startsWith('Category: ')) {
           category = line.replace('Category: ', '').trim();
         } else if (line.startsWith('Question: ')) {
           question = line.replace('Question: ', '').trim();
-        } else if (line.startsWith('Context: ')) {
-          context = line.replace('Context: ', '').trim();
         } else if (line.startsWith('Answer: ')) {
           answer = line.replace('Answer: ', '').trim();
         }
+        // Context is no longer parsed from user input - it will be auto-generated
       }
 
       if (!category || !question || !answer) {
-        await this.bot.sendMessage(chatId, 'Missing required fields. Please provide Category, Question, and Answer.');
+        await this.bot.sendMessage(chatId, '❌ Missing required fields. Please provide Category, Question, and Answer.\n\n📝 Format:\nCategory: category name\nQuestion: question content\nAnswer: answer content');
         return;
       }
 
-      const updated = await this.kbManager.updateEntry(kbId, category, question, context, answer);
+      // Use the new auto-context method with duplicate detection
+      const updated = await this.kbManager.updateEntryWithAutoContext(kbId, category, question, answer);
       
       if (updated) {
-        await this.bot.sendMessage(chatId, `✅ KB entry #${kbId} updated successfully!`);
+        await this.bot.sendMessage(chatId, `✅ KB entry #${kbId} updated successfully!\n🤖 Context was automatically updated.`);
         await this.showKBMenu(chatId);
       } else {
         await this.bot.sendMessage(chatId, '❌ KB entry not found.');
@@ -527,7 +594,13 @@ private setupMessageHandlers(): void {
 
     } catch (error) {
       console.error('Error editing KB entry:', error);
-      await this.sendErrorMessage(chatId, 'Error editing KB entry. Please try again.');
+      
+      // Check if it's a duplicate entry error
+      if (error instanceof Error && error.message.includes('Similar KB entry already exists')) {
+        await this.bot.sendMessage(chatId, `❌ ${error.message}\n\nPlease modify your question to make it more specific or check existing entries.`);
+      } else {
+        await this.sendErrorMessage(chatId, 'Error editing KB entry. Please try again.');
+      }
     }
   }
 
@@ -687,22 +760,31 @@ private setupMessageHandlers(): void {
         // Don't throw here - the message was saved, just status update failed
       }
 
-      // Send confirmation to customer with retry
-      try {
-        await this.sendMessageWithRetry(chatId, 
-          `Thank you for your message! Your ticket #${ticketId.toString().padStart(6, '0')} has been ${isNewTicket ? 'created' : 'updated'}. Our team will respond shortly.`
-        );
-      } catch (confirmError) {
-        console.error(`🔴 Failed to send confirmation to customer ${chatId}:`, confirmError);
-        // Don't throw - the ticket was created successfully
-      }
+      // Check for automated response before notifying managers (only if no manager assigned)
+      const automatedResponse = await this.checkForAutomatedResponse(message, ticketId);
+      
+      if (automatedResponse) {
+        // Send automated response to customer
+        await this.sendAutomatedResponse(chatId, ticketId, automatedResponse);
+        console.log(`🤖 Automated response sent for ticket #${ticketId}`);
+      } else {
+        // Send confirmation to customer with retry
+        try {
+          await this.sendMessageWithRetry(chatId, 
+            `Thank you for your message! Your ticket #${ticketId.toString().padStart(6, '0')} has been ${isNewTicket ? 'created' : 'updated'}. Our team will respond shortly.`
+          );
+        } catch (confirmError) {
+          console.error(`🔴 Failed to send confirmation to customer ${chatId}:`, confirmError);
+          // Don't throw - the ticket was created successfully
+        }
 
-      // Notify managers
-      try {
-        await this.notifyManagers(ticketId, username, message, isNewTicket);
-      } catch (notifyError) {
-        console.error(`🔴 Failed to notify managers for ticket #${ticketId}:`, notifyError);
-        // Don't throw - the ticket was created successfully
+        // Notify managers only if no automated response was sent
+        try {
+          await this.notifyManagers(ticketId, username, message, isNewTicket);
+        } catch (notifyError) {
+          console.error(`🔴 Failed to notify managers for ticket #${ticketId}:`, notifyError);
+          // Don't throw - the ticket was created successfully
+        }
       }
 
       const processingTime = Date.now() - startTime;
@@ -725,8 +807,285 @@ private setupMessageHandlers(): void {
       
       await this.sendErrorMessage(chatId, errorMessage);
     }
-  } 
- private async notifyManagers(ticketId: number, username: string, message: string, isNewTicket: boolean): Promise<void> {
+  }
+
+  private async checkForAutomatedResponse(message: string, ticketId?: number): Promise<AutoResponseResult | null> {
+    try {
+      console.log(`🔍 Checking for automated response for message: "${message.substring(0, 100)}${message.length > 100 ? '...' : ''}"`);
+      
+      // Check if vector service is enabled
+      if (!this.vectorIntegration.isVectorServiceEnabled()) {
+        console.log(`🔶 Vector service disabled, skipping automated response check`);
+        return null;
+      }
+      
+      // If ticketId is provided, check if ticket already has a manager assigned
+      if (ticketId) {
+        try {
+          const ticket = await this.sessionManager.getTicketById(ticketId);
+          if (ticket && ticket.operator_chat_id) {
+            console.log(`👨‍💼 Ticket #${ticketId} already has manager assigned (@${ticket.operator_username}), skipping automated response`);
+            return null;
+          }
+        } catch (error) {
+          console.warn(`⚠️ Could not check ticket assignment status for #${ticketId}:`, error);
+          // Continue with automated response check
+        }
+      }
+      
+      // Use vector integration to search for similar content
+      const result = await this.vectorIntegration.searchSimilarContent(message);
+      
+      if (result) {
+        // Additional threshold validation (the vector integration already checks this, but double-check for safety)
+        const vectorConfig = config.getVectorServiceConfig();
+        if (result.similarityScore < vectorConfig.similarityThreshold) {
+          console.log(`📊 Similarity score ${result.similarityScore} below configured threshold ${vectorConfig.similarityThreshold}`);
+          await this.logAutomatedResponseAttempt(message, false, `Similarity score ${result.similarityScore} below threshold ${vectorConfig.similarityThreshold}`);
+          return null;
+        }
+        
+        console.log(`✅ Found automated response: KB ID ${result.kbId}, confidence: ${result.confidence}, similarity: ${result.similarityScore.toFixed(3)}`);
+        await this.logAutomatedResponseAttempt(message, true, `Match found: KB ${result.kbId}, score ${result.similarityScore.toFixed(3)}, confidence ${result.confidence}`);
+        return result;
+      } else {
+        console.log(`❌ No suitable automated response found (no high-similarity matches)`);
+        await this.logAutomatedResponseAttempt(message, false, 'No high-similarity matches found');
+        return null;
+      }
+    } catch (error) {
+      console.error(`🔴 Error checking for automated response:`, error);
+      // Return null for graceful degradation - system will fall back to manager notification
+      return null;
+    }
+  }
+
+  private async sendAutomatedResponse(chatId: number, ticketId: number, autoResponse: AutoResponseResult): Promise<void> {
+    try {
+      const ticketNumber = ticketId.toString().padStart(6, '0');
+      const confidenceEmoji = autoResponse.confidence === 'high' ? '🎯' : 
+                             autoResponse.confidence === 'medium' ? '🎲' : '💡';
+      
+      // Prepare the automated response message with confidence details
+      const confidenceText = this.getConfidenceText(autoResponse.confidence, autoResponse.similarityScore);
+      const responseMessage = `🤖 Automated Response for Ticket #${ticketNumber}:\n\n${autoResponse.answer}\n\n${confidenceEmoji} ${confidenceText}\n\nIf this doesn't fully answer your question, our team will follow up with you shortly.`;
+      
+      // Send the automated response to the customer
+      await this.sendMessageWithRetry(chatId, responseMessage);
+      
+      // Update ticket status to REPLIED and keep assigned manager as NULL (as per requirement 2.3)
+      await this.sessionManager.updateTicketStatus(ticketId, TicketStatus.REPLIED);
+      
+      // Add the automated response to message history with metadata
+      const responseMessageId = await this.historyManager.addMessage(
+        ticketId,
+        MessageSide.TO,
+        'AutoBot',
+        0, // Use 0 as chat_id for automated responses
+        `[AUTOMATED] ${autoResponse.answer} [KB:${autoResponse.kbId}, Score:${autoResponse.similarityScore.toFixed(3)}, Confidence:${autoResponse.confidence}]`
+      );
+      
+      // Update last reply ID to track the automated response
+      await this.sessionManager.updateLastReplyId(ticketId, responseMessageId);
+      
+      // Log the automated response for tracking
+      this.logAutomatedResponse(ticketId, autoResponse, true);
+      
+      console.log(`✅ Automated response sent successfully for ticket #${ticketId} (KB:${autoResponse.kbId}, Score:${autoResponse.similarityScore.toFixed(3)})`);
+    } catch (error) {
+      console.error(`🔴 Error sending automated response for ticket #${ticketId}:`, error);
+      
+      // Log the failed attempt
+      this.logAutomatedResponse(ticketId, autoResponse, false, error instanceof Error ? error.message : 'Unknown error');
+      
+      // Don't throw - let the system fall back to normal manager notification
+      throw error;
+    }
+  }
+
+  private getConfidenceText(confidence: 'high' | 'medium' | 'low', similarityScore: number): string {
+    const scorePercent = Math.round(similarityScore * 100);
+    
+    switch (confidence) {
+      case 'high':
+        return `High confidence match (${scorePercent}% similarity)`;
+      case 'medium':
+        return `Medium confidence match (${scorePercent}% similarity)`;
+      case 'low':
+        return `Low confidence match (${scorePercent}% similarity)`;
+      default:
+        return `Match found (${scorePercent}% similarity)`;
+    }
+  }
+
+  private logAutomatedResponse(ticketId: number, autoResponse: AutoResponseResult, success: boolean, errorMessage?: string): void {
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      ticketId,
+      kbId: autoResponse.kbId,
+      similarityScore: autoResponse.similarityScore,
+      confidence: autoResponse.confidence,
+      success,
+      errorMessage: errorMessage || (success ? 'Response sent successfully' : 'Failed to send response'),
+      responseType: 'automated'
+    };
+    
+    // Log to console with structured format
+    console.log('🤖 Automated Response Log:', JSON.stringify(logEntry));
+    
+    // Store in database for audit trail and metrics
+    this.storeAutomatedResponseLog(logEntry);
+  }
+
+  private async storeAutomatedResponseLog(logEntry: any): Promise<void> {
+    try {
+      const db = this.dbManager.getConnection();
+      
+      // Create automated_responses table if it doesn't exist
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS automated_responses (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ticket_id INTEGER NOT NULL,
+          kb_id INTEGER,
+          similarity_score REAL,
+          confidence TEXT,
+          success BOOLEAN NOT NULL,
+          error_message TEXT,
+          response_time_ms INTEGER,
+          create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (ticket_id) REFERENCES sessions(id),
+          FOREIGN KEY (kb_id) REFERENCES knowledge_base(id)
+        )
+      `);
+      
+      // Insert the log entry
+      const stmt = db.prepare(`
+        INSERT INTO automated_responses 
+        (ticket_id, kb_id, similarity_score, confidence, success, error_message, create_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      
+      stmt.run(
+        logEntry.ticketId,
+        logEntry.kbId,
+        logEntry.similarityScore,
+        logEntry.confidence,
+        logEntry.success ? 1 : 0,
+        logEntry.errorMessage,
+        logEntry.timestamp
+      );
+      
+      console.log(`📊 Automated response log stored in database for ticket #${logEntry.ticketId}`);
+    } catch (error) {
+      console.error('🔴 Error storing automated response log:', error);
+      // Don't throw - logging failure shouldn't break the main flow
+    }
+  }
+
+  private async logAutomatedResponseAttempt(message: string, found: boolean, reason?: string): Promise<void> {
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      messagePreview: message.substring(0, 100),
+      attemptResult: found ? 'match_found' : 'no_match',
+      reason: reason || (found ? 'Suitable match found' : 'No suitable match found'),
+      responseType: 'attempt'
+    };
+    
+    console.log('🔍 Automated Response Attempt Log:', JSON.stringify(logEntry));
+    
+    // Store attempt metrics for analysis
+    try {
+      const db = this.dbManager.getConnection();
+      
+      // Create automated_response_attempts table if it doesn't exist
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS automated_response_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_preview TEXT,
+          attempt_result TEXT NOT NULL,
+          reason TEXT,
+          create_time DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      
+      const stmt = db.prepare(`
+        INSERT INTO automated_response_attempts 
+        (message_preview, attempt_result, reason, create_time)
+        VALUES (?, ?, ?, ?)
+      `);
+      
+      stmt.run(
+        logEntry.messagePreview,
+        logEntry.attemptResult,
+        logEntry.reason,
+        logEntry.timestamp
+      );
+    } catch (error) {
+      console.error('🔴 Error storing automated response attempt log:', error);
+    }
+  }
+
+  private async getAutomatedResponseMetrics(): Promise<any> {
+    try {
+      const db = this.dbManager.getConnection();
+      
+      // Get success rate
+      const successRate = db.prepare(`
+        SELECT 
+          COUNT(*) as total_attempts,
+          SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_responses,
+          ROUND(
+            (SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 2
+          ) as success_rate_percent
+        FROM automated_responses
+        WHERE create_time >= datetime('now', '-30 days')
+      `).get() as any;
+      
+      // Get confidence distribution
+      const confidenceDistribution = db.prepare(`
+        SELECT 
+          confidence,
+          COUNT(*) as count,
+          ROUND((COUNT(*) * 100.0 / (SELECT COUNT(*) FROM automated_responses WHERE create_time >= datetime('now', '-30 days'))), 2) as percentage
+        FROM automated_responses 
+        WHERE create_time >= datetime('now', '-30 days') AND success = 1
+        GROUP BY confidence
+        ORDER BY count DESC
+      `).all() as any[];
+      
+      // Get average similarity scores by confidence
+      const avgSimilarityByConfidence = db.prepare(`
+        SELECT 
+          confidence,
+          ROUND(AVG(similarity_score), 3) as avg_similarity_score,
+          COUNT(*) as count
+        FROM automated_responses 
+        WHERE create_time >= datetime('now', '-30 days') AND success = 1
+        GROUP BY confidence
+      `).all() as any[];
+      
+      // Get attempt vs success ratio
+      const attemptMetrics = db.prepare(`
+        SELECT 
+          (SELECT COUNT(*) FROM automated_response_attempts WHERE create_time >= datetime('now', '-30 days')) as total_attempts,
+          (SELECT COUNT(*) FROM automated_responses WHERE create_time >= datetime('now', '-30 days') AND success = 1) as successful_responses
+      `).get() as any;
+      
+      return {
+        period: 'Last 30 days',
+        successRate,
+        confidenceDistribution,
+        avgSimilarityByConfidence,
+        attemptMetrics,
+        generatedAt: new Date().toISOString()
+      };
+    } catch (error) {
+      console.error('🔴 Error generating automated response metrics:', error);
+      return null;
+    }
+  }
+
+  private async notifyManagers(ticketId: number, username: string, message: string, isNewTicket: boolean): Promise<void> {
     const ticketNumber = ticketId.toString().padStart(6, '0');
     const truncatedMessage = message.length > 200 ? message.substring(0, 200) + '...' : message;
     
@@ -974,6 +1333,9 @@ private setupMessageHandlers(): void {
         case 'admin_stats':
           await this.showStats(chatId);
           break;
+        case 'auto_stats':
+          await this.showDetailedAutoStats(chatId);
+          break;
         case 'managers_add':
           await this.promptAddManager(chatId);
           break;
@@ -1084,12 +1446,32 @@ private setupMessageHandlers(): void {
     try {
       const db = this.dbManager.getConnection();
       
-      // Get statistics
+      // Get basic statistics
       const totalTickets = db.prepare('SELECT COUNT(*) as count FROM sessions').get() as { count: number };
       const openTickets = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE status IN (0, 1, 2)').get() as { count: number };
       const closedTickets = db.prepare('SELECT COUNT(*) as count FROM sessions WHERE status = 3').get() as { count: number };
       const totalManagers = db.prepare('SELECT COUNT(*) as count FROM managers WHERE is_active = 1').get() as { count: number };
       const totalKBEntries = await this.kbManager.getEntryCount();
+
+      // Get automated response statistics
+      let automatedStats = '';
+      try {
+        const autoResponseCount = db.prepare('SELECT COUNT(*) as count FROM automated_responses WHERE success = 1 AND create_time >= datetime("now", "-30 days")').get() as { count: number } | undefined;
+        const totalAttempts = db.prepare('SELECT COUNT(*) as count FROM automated_response_attempts WHERE create_time >= datetime("now", "-30 days")').get() as { count: number } | undefined;
+        
+        if (autoResponseCount && totalAttempts) {
+          const successRate = totalAttempts.count > 0 ? Math.round((autoResponseCount.count / totalAttempts.count) * 100) : 0;
+          automatedStats = `\n\n🤖 Automated Responses (30 days):
+📈 Successful: ${autoResponseCount.count}
+🎯 Attempts: ${totalAttempts.count}
+📊 Success Rate: ${successRate}%`;
+        } else {
+          automatedStats = '\n\n🤖 Automated Responses: No data available';
+        }
+      } catch (autoError) {
+        console.warn('Could not retrieve automated response stats:', autoError);
+        automatedStats = '\n\n🤖 Automated Responses: Stats unavailable';
+      }
 
       const message = `📊 System Statistics:
 
@@ -1097,11 +1479,14 @@ private setupMessageHandlers(): void {
 🟢 Open Tickets: ${openTickets.count}
 🔴 Closed Tickets: ${closedTickets.count}
 👥 Active Managers: ${totalManagers.count}
-📚 KB Entries: ${totalKBEntries}`;
+📚 KB Entries: ${totalKBEntries}${automatedStats}`;
 
       const keyboard = {
         inline_keyboard: [
-          [{ text: '⬅️ Back to Main Menu', callback_data: 'back_main' }]
+          [
+            { text: '🤖 Detailed Auto Stats', callback_data: 'auto_stats' },
+            { text: '⬅️ Back to Main Menu', callback_data: 'back_main' }
+          ]
         ]
       };
 
@@ -1109,6 +1494,63 @@ private setupMessageHandlers(): void {
     } catch (error) {
       console.error('Error showing stats:', error);
       await this.sendErrorMessage(chatId, 'Error retrieving statistics.');
+    }
+  }
+
+  private async showDetailedAutoStats(chatId: number): Promise<void> {
+    try {
+      const metrics = await this.getAutomatedResponseMetrics();
+      
+      if (!metrics) {
+        await this.bot.sendMessage(chatId, '❌ Unable to retrieve automated response metrics.');
+        return;
+      }
+
+      let message = `🤖 Detailed Automated Response Statistics (${metrics.period}):\n\n`;
+      
+      // Success rate
+      message += `📈 **Success Rate:**\n`;
+      message += `• Total Attempts: ${metrics.successRate.total_attempts || 0}\n`;
+      message += `• Successful Responses: ${metrics.successRate.successful_responses || 0}\n`;
+      message += `• Success Rate: ${metrics.successRate.success_rate_percent || 0}%\n\n`;
+      
+      // Confidence distribution
+      if (metrics.confidenceDistribution.length > 0) {
+        message += `🎯 **Confidence Distribution:**\n`;
+        metrics.confidenceDistribution.forEach((conf: any) => {
+          const emoji = conf.confidence === 'high' ? '🟢' : conf.confidence === 'medium' ? '🟡' : '🔴';
+          message += `${emoji} ${conf.confidence}: ${conf.count} (${conf.percentage}%)\n`;
+        });
+        message += '\n';
+      }
+      
+      // Average similarity scores
+      if (metrics.avgSimilarityByConfidence.length > 0) {
+        message += `📊 **Average Similarity Scores:**\n`;
+        metrics.avgSimilarityByConfidence.forEach((avg: any) => {
+          message += `• ${avg.confidence}: ${avg.avg_similarity_score} (${avg.count} responses)\n`;
+        });
+        message += '\n';
+      }
+      
+      // Attempt metrics
+      message += `🔍 **Attempt Analysis:**\n`;
+      message += `• Search Attempts: ${metrics.attemptMetrics.total_attempts || 0}\n`;
+      message += `• Successful Matches: ${metrics.attemptMetrics.successful_responses || 0}\n`;
+      const matchRate = metrics.attemptMetrics.total_attempts > 0 ? 
+        Math.round((metrics.attemptMetrics.successful_responses / metrics.attemptMetrics.total_attempts) * 100) : 0;
+      message += `• Match Rate: ${matchRate}%\n`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '⬅️ Back to Stats', callback_data: 'admin_stats' }]
+        ]
+      };
+
+      await this.bot.sendMessage(chatId, message, { reply_markup: keyboard });
+    } catch (error) {
+      console.error('Error showing detailed auto stats:', error);
+      await this.sendErrorMessage(chatId, 'Error retrieving detailed automated response statistics.');
     }
   }
 
@@ -1198,18 +1640,20 @@ private setupMessageHandlers(): void {
 
   private async promptAddKB(chatId: number): Promise<void> {
     await this.bot.sendMessage(chatId, 
-      'To add a new KB entry, please send the information in this format:\n\n' +
+      '📝 To add a new KB entry, please send the information in this format:\n\n' +
       'ADD_KB\n' +
       'Category: [category]\n' +
       'Question: [question]\n' +
-      'Context: [context]\n' +
       'Answer: [answer]\n\n' +
-      'Example:\n' +
+      '💡 Example:\n' +
       'ADD_KB\n' +
       'Category: Account\n' +
       'Question: How to reset password?\n' +
-      'Context: User forgot password\n' +
-      'Answer: Go to login page and click "Forgot Password"'
+      'Answer: Go to login page and click "Forgot Password"\n\n' +
+      '🔍 To check for similar entries first, use:\n' +
+      'CHECK_SIMILAR [your question]\n\n' +
+      '🤖 Note: Context will be automatically generated based on the question.\n' +
+      '⚠️ The system will automatically prevent duplicate entries.'
     );
   }
 
@@ -1317,7 +1761,6 @@ private setupMessageHandlers(): void {
         `EDIT_KB ${kbId}\n` +
         `Category: ${entry.category}\n` +
         `Question: ${entry.question}\n` +
-        `Context: ${entry.context || ''}\n` +
         `Answer: ${entry.answer}`;
 
       await this.bot.sendMessage(chatId, 
@@ -1325,12 +1768,13 @@ private setupMessageHandlers(): void {
         `**Current Content:**\n` +
         `Category: ${entry.category}\n` +
         `Question: ${entry.question}\n` +
-        `Context: ${entry.context || 'N/A'}\n` +
+        `Context: ${entry.context || 'Auto-generated'}\n` +
         `Answer: ${entry.answer}\n\n` +
-        `**Instructions:**\n` +
+        `**How to Edit:**\n` +
         `Copy the template below, modify only the parts you want to change, then send it:\n\n` +
         `\`\`\`\n${preFilledTemplate}\n\`\`\`\n\n` +
-        `💡 **Tip:** You can copy this text and only change the specific fields you need to update.`,
+        `🤖 **Note:** Context will be automatically updated based on the question.\n` +
+        `💡 **Tip:** Copy this text and modify only the fields you need to update.`,
         { parse_mode: 'Markdown' }
       );
     } catch (error) {

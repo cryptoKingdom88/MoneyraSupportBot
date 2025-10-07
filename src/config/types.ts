@@ -11,3 +11,13 @@ export interface DatabaseConfig {
     fileMustExist?: boolean;
   };
 }
+
+export interface VectorServiceConfig {
+  enabled: boolean;
+  baseUrl: string;
+  timeout: number;
+  retryAttempts: number;
+  retryDelay: number;
+  similarityThreshold: number;
+  maxResponseLength: number;
+}
