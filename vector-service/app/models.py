@@ -65,10 +65,6 @@ class KBEntry:
         self.create_time = create_time
         self.update_time = update_time
     
-    def get_combined_text(self) -> str:
-        """Get combined text for vectorization"""
-        return f"{self.question} {self.context}".strip()
-    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return {

@@ -127,6 +127,8 @@ export class KBManager implements IKBManager {
 
   // Vector-enhanced methods with duplicate detection and embedding storage
   public async addEntryWithAutoContext(category: string, question: string, answer: string): Promise<number> {
+    console.log(`🔍 DEBUG - addEntryWithAutoContext called: question="${question}"`);
+    
     // Check for similar entries before adding
     const duplicateCheck = await this.checkForSimilarEntry(question);
     if (duplicateCheck.hasSimilar) {
@@ -135,12 +137,14 @@ export class KBManager implements IKBManager {
 
     // Generate embedding and store it in context field
     const embeddingContext = await this.generateEmbeddingContext(question, answer);
+    console.log(`🔍 DEBUG - Generated embeddingContext length: ${embeddingContext.length}`);
 
     // Add to database with embedding as context
     const kbId = await this.addEntry(category, question, embeddingContext, answer);
 
     // Then sync with vector service (use original question, not embedding context)
     if (this.vectorIntegration) {
+      console.log(`🔍 DEBUG - Calling syncVectorOnAdd with question="${question}", context=""`);
       await this.vectorIntegration.syncVectorOnAdd(kbId, question, '', answer);
     }
 
@@ -161,31 +165,6 @@ export class KBManager implements IKBManager {
     const success = await this.updateEntry(id, category, question, embeddingContext, answer);
 
     // Then sync with vector service if database update was successful (use original question, not embedding context)
-    if (success && this.vectorIntegration) {
-      await this.vectorIntegration.syncVectorOnUpdate(id, question, '', answer);
-    }
-
-    return success;
-  }
-
-  // Legacy methods with manual context (for backward compatibility)
-  public async addEntryWithVector(category: string, question: string, context: string, answer: string): Promise<number> {
-    // First add to database
-    const kbId = await this.addEntry(category, question, context, answer);
-
-    // Then sync with vector service (use original question, not context)
-    if (this.vectorIntegration) {
-      await this.vectorIntegration.syncVectorOnAdd(kbId, question, '', answer);
-    }
-
-    return kbId;
-  }
-
-  public async updateEntryWithVector(id: number, category: string, question: string, context: string, answer: string): Promise<boolean> {
-    // First update database
-    const success = await this.updateEntry(id, category, question, context, answer);
-
-    // Then sync with vector service if database update was successful (use original question, not context)
     if (success && this.vectorIntegration) {
       await this.vectorIntegration.syncVectorOnUpdate(id, question, '', answer);
     }
@@ -273,18 +252,6 @@ export class KBManager implements IKBManager {
     }
   }
 
-  public async deleteEntryWithVector(id: number): Promise<boolean> {
-    // First delete from database
-    const success = await this.deleteEntry(id);
-
-    // Then sync with vector service if database delete was successful
-    if (success && this.vectorIntegration) {
-      await this.vectorIntegration.syncVectorOnDelete(id);
-    }
-
-    return success;
-  }
-
   public async searchSimilarContent(query: string): Promise<AutoResponseResult | null> {
     if (!this.vectorIntegration) {
       console.log('Vector integration not available, cannot perform similarity search');
@@ -321,11 +288,6 @@ export class KBManager implements IKBManager {
       const result = stmt.run(category, question, context, answer);
       const kbId = result.lastInsertRowid as number;
 
-      // Auto-sync with vector service if available and enabled (use original question, not context)
-      if (this.vectorIntegration && this.vectorIntegration.isVectorServiceEnabled()) {
-        await this.vectorIntegration.syncVectorOnAdd(kbId, question, '', answer);
-      }
-
       return kbId;
     } catch (error) {
       console.error('Error adding KB entry:', error);
@@ -343,11 +305,6 @@ export class KBManager implements IKBManager {
 
       const result = stmt.run(category, question, context, answer, id);
       const success = result.changes > 0;
-
-      // Auto-sync with vector service if available and enabled (use original question, not context)
-      if (success && this.vectorIntegration && this.vectorIntegration.isVectorServiceEnabled()) {
-        await this.vectorIntegration.syncVectorOnUpdate(id, question, '', answer);
-      }
 
       return success;
     } catch (error) {

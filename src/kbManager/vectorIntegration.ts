@@ -46,7 +46,8 @@ export class VectorIntegrationImpl implements VectorIntegration {
         return;
       }
 
-      const inputText = this.combineQuestionAndContext(question, context);
+      const inputText = question;
+      console.log(`🔍 DEBUG - syncVectorOnAdd: question="${question}", context="${context}", inputText="${inputText}"`);
       const response = await this.vectorClient.addVector(kbId, inputText, answer);
 
       if (!response.success) {
@@ -82,6 +83,7 @@ export class VectorIntegrationImpl implements VectorIntegration {
       }
 
       const inputText = this.combineQuestionAndContext(question, context);
+      console.log(`🔍 DEBUG - syncVectorOnUpdate: question="${question}", context="${context}", inputText="${inputText}"`);
       const response = await this.vectorClient.updateVector(kbId, inputText, answer);
 
       if (!response.success) {

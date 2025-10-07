@@ -103,7 +103,7 @@ class VectorManager:
                     logger.debug(f"Loaded stored embedding for KB ID {entry.id}")
                 else:
                     # Generate new embedding if not stored
-                    combined_text = entry.get_combined_text()
+                    combined_text = entry.question
                     if combined_text.strip():
                         logger.info(f"Generating new embedding for KB ID {entry.id}")
                         new_embedding = self.sentence_transformer.encode([combined_text], convert_to_numpy=True)[0]

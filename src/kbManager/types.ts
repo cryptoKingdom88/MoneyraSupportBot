@@ -12,10 +12,6 @@ export interface KBManager {
   getCategories(): Promise<string[]>;
   getEntryCount(): Promise<number>;
   
-  // Vector-enhanced methods with manual context (legacy)
-  addEntryWithVector(category: string, question: string, context: string, answer: string): Promise<number>;
-  updateEntryWithVector(id: number, category: string, question: string, context: string, answer: string): Promise<boolean>;
-  deleteEntryWithVector(id: number): Promise<boolean>;
   searchSimilarContent(query: string): Promise<AutoResponseResult | null>;
   
   // New methods with auto-context generation and duplicate detection
